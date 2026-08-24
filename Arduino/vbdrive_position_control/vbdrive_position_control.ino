@@ -1,14 +1,12 @@
-#include <utility>
-
+/*
+Документация к прошивке VBDrive https://github.com/VBCores/VBDrive
+Библиотека для работы с cyphal https://github.com/VBCores/libcxxcanard
+Библиотека для работы с VBCoreG4 https://github.com/VBCores/VBCoreG4_arduino_system 
+Документация к VBCoreG4 https://docs.vbcores.ru 
+*/
 #include <VBCoreG4_arduino_system.h>
 #include <cyphal.h>
-
-#include <uavcan/node/Heartbeat_1_0.h>
-#include <uavcan/node/Health_1_0.h>
-#include <uavcan/node/Mode_1_0.h>
-#include <voltbro/foc/state_simple_1_0.h>
-#include <voltbro/foc/command_1_0.h>
-#include <uavcan/si/unit/angular_velocity/Scalar_1_0.h>
+#include <cyphal_common_types.hpp>
 
 /* ============================================================
  *                 ПАРАМЕТРЫ УПРАВЛЕНИЯ
@@ -17,8 +15,8 @@
  * A           — амплитуда задаваемой траектории
  * FREQ        — частота задаваемой траектории
  */
-#define KP    25
-#define KD    0.2
+#define KP    30
+#define KD    0.8
 #define A     0.7
 #define FREQ  0.5
 
@@ -30,65 +28,47 @@
  * TIM7 — вывод данных в Serial (200 Гц)
  * TIM3 — отправка команд на мотор (1 кГц)
  */
-HardwareTimer *timer_create_func  = new HardwareTimer(TIM5);
-HardwareTimer *timer_show_data    = new HardwareTimer(TIM7);
+HardwareTimer *timer_create_func = new HardwareTimer(TIM5);
+HardwareTimer *timer_show_data = new HardwareTimer(TIM7);
 HardwareTimer *timer_send_command = new HardwareTimer(TIM3);
 
 
 /* ============================================================
- *        НАСТРОЙКА CYPHAL / CAN (служебная часть)
- *        !!! НЕ МЕНЯТЬ !!!
+ *              НАСТРОЙКА CYPHAL / CAN (служебная часть)
+ *                          НЕ МЕНЯТЬ
  * ============================================================
  */
-void error_handler() {
-    Serial.println("Unrecoverable commands error!");
-    while (1) {}
-}
+constexpr CanardNodeID NODE_ID = 2;
+constexpr CanardPortID FOC_STATE_RX_PORT_ID = 3811; // текущее состояние VBDrive
+constexpr CanardPortID FOC_COMMAND_TX_PORT_ID = 2118; // 2107 + VBDrive ID
 
-UtilityConfig utilities(micros, error_handler);
+CanFD canfd;
+std::shared_ptr<ArduinoCyphal<>> cyphal;
 
-// Алиасы типов сообщений Cyphal
-TYPE_ALIAS(HBeat,      uavcan_node_Heartbeat_1_0)
-TYPE_ALIAS(FocState,   voltbro_foc_state_simple_1_0);
-TYPE_ALIAS(FOCCommand, voltbro_foc_command_1_0)
-
-// Статусы ноды
-static uint8_t CYPHAL_HEALTH_STATUS = uavcan_node_Health_1_0_NOMINAL;
-static uint8_t CYPHAL_MODE          = uavcan_node_Mode_1_0_INITIALIZATION;
-static CanardNodeID NODE_ID;
-
-constexpr uint64_t MICROS_S = 1'000'000;
-
-// CAN / Cyphal объекты
-CanFD* canfd;
-FDCAN_HandleTypeDef* hfdcan1;
-static bool _is_cyphal_on = false;
-static std::shared_ptr<CyphalInterface> cyphal_interface;
+static CanardTransferID command_transfer_id = 0;
 
 
 /* ============================================================
  *        ПЕРЕМЕННЫЕ УПРАВЛЕНИЯ МОТОРОМ
  * ============================================================
  */
-float target_angle   = 0.0;   // задаваемый угол
-float target_vel     = 0.0;   // задаваемая скорость
-float received_angle = 0.0;   // текущий угол с мотора
+float target_angle = 0.0;
+float target_vel = 0.0;
+float received_angle = 0.0;
 
 
 /* ============================================================
- *        ФЛАГИ ДЛЯ РАБОТЫ В loop()
+ *        ФЛАГИ
  * ============================================================
- * Устанавливаются в обработчиках таймеров
  */
-int flag_send_comm = 0;
-int flag_show_data = 0;
+volatile bool flag_send_comm = false;
+volatile bool flag_show_data = false;
 
 
 /* ============================================================
  *        ОБЪЯВЛЕНИЯ ФУНКЦИЙ
  * ============================================================
  */
-void heartbeat();
 void set_flag_send_command();
 void set_flag_show_data();
 void create_func();
@@ -96,35 +76,19 @@ void send_command();
 
 
 /* ============================================================
- *        ПОДПИСЧИКИ CYPHAL
+ *        ПОДПИСКИ CYPHAL
  * ============================================================
  */
 
-// Подписка на состояние мотора
-class FOCStateSub : public AbstractSubscription<FocState> {
-public:
-    FOCStateSub(InterfacePtr interface)
-        : AbstractSubscription<FocState>(interface, 3811) {} // порт состояния мотора
+//На состояние привода - угол, скорость, момент и т.п
+void foc_state_handler(const FocState& msg, CanardRxTransfer* transfer) {
+    received_angle = msg.angle.radian;
+}
 
-    void handler(const FocState::Type& msg, CanardRxTransfer*) override {
-        received_angle = msg.angle.radian; // сохраняем текущий угол
-        digitalToggle(LED2);               // индикация приема сообщения
-    }
-};
-FOCStateSub* foc_state_sub = nullptr;
-
-
-// Подписка на heartbeat мотора
-class HBeatSub : public AbstractSubscription<HBeat> {
-public:
-    HBeatSub(InterfacePtr interface)
-        : AbstractSubscription<HBeat>(interface, 7509) {} // порт heartbeat
-
-    void handler(const HBeat::Type&, CanardRxTransfer*) override {
-        // heartbeat принимается, но не используется
-    }
-};
-HBeatSub* hbeat_sub = nullptr;
+//Heartbeat - сообщение, которое сигнализирует о том, что привод в сети и передает данные
+void heartbeat_handler(const Heartbeat& msg, CanardRxTransfer* transfer) {
+    digitalToggle(LED2);
+}
 
 
 /* ============================================================
@@ -132,62 +96,45 @@ HBeatSub* hbeat_sub = nullptr;
  * ============================================================
  */
 void can_config(int ID) {
-
     SystemClock_Config();
 
-    canfd = new CanFD();
-    canfd->init();
-    canfd->write_default_params(); // 1000k nominal / 8M data
-    canfd->apply_config();
-    hfdcan1 = canfd->get_hfdcan();
-    canfd->default_start();
+    canfd.init();
+    canfd.write_default_params();
+    canfd.apply_config();
 
-    NODE_ID = ID;
+    cyphal = make_cyphal<ArduinoCyphal<>>(canfd.get_hfdcan(), ID, "org.vbcores.vbdrive");
 
-    size_t queue_len = 200;
-    cyphal_interface = std::shared_ptr<CyphalInterface>(
-        CyphalInterface::create_heap<G4CAN, O1Allocator>(
-            NODE_ID,
-            hfdcan1,
-            queue_len,
-            utilities
-        )
-    );
+    cyphal->subscribe(FOC_STATE_RX_PORT_ID, foc_state_handler);
+    cyphal->subscribe(uavcan_node_Heartbeat_1_0_FIXED_PORT_ID_, heartbeat_handler);
 
-    hbeat_sub     = new HBeatSub(cyphal_interface);
-    foc_state_sub = new FOCStateSub(cyphal_interface);
-
-    _is_cyphal_on = true;
-    CYPHAL_MODE   = uavcan_node_Mode_1_0_OPERATIONAL;
+    cyphal->begin();
 }
 
 
-/* ============================================================
- *        SETUP
- * ============================================================
- */
 void setup() {
-
     Serial.begin(115200);
     pinMode(LED2, OUTPUT);
 
-    can_config(2);
+    can_config(NODE_ID);
 
-    // Таймер генерации траектории
+
+    // Генерация траектории — 1 кГц
     timer_create_func->pause();
     timer_create_func->setOverflow(1000, HERTZ_FORMAT);
     timer_create_func->attachInterrupt(create_func);
     timer_create_func->refresh();
     timer_create_func->resume();
 
-    // Таймер вывода данных
+
+    // Вывод данных — 200 Гц
     timer_show_data->pause();
     timer_show_data->setOverflow(200, HERTZ_FORMAT);
     timer_show_data->attachInterrupt(set_flag_show_data);
     timer_show_data->refresh();
     timer_show_data->resume();
 
-    // Таймер отправки команд
+
+    // Отправка команды — 1 кГц
     timer_send_command->pause();
     timer_send_command->setOverflow(1000, HERTZ_FORMAT);
     timer_send_command->attachInterrupt(set_flag_send_command);
@@ -196,36 +143,20 @@ void setup() {
 }
 
 
-/* ============================================================
- *        LOOP
- * ============================================================
- */
 void loop() {
+    cyphal->cyphal_loop();
 
-    // Обработка входящих/исходящих Cyphal сообщений
-    cyphal_interface->loop();
-
-    static uint32_t t_heartbeat = 0;
-    uint32_t now = millis();
-
-    // Heartbeat — обязательное сообщение Cyphal (1 Гц)
-    if (now - t_heartbeat >= 1000) {
-        heartbeat();
-        t_heartbeat = now;
-    }
-
-    // Вывод данных по таймеру
     if (flag_show_data) {
         Serial.print(target_angle);
         Serial.print(" ");
         Serial.println(received_angle);
-        flag_show_data = 0;
+
+        flag_show_data = false;
     }
 
-    // Отправка команды мотору по таймеру
     if (flag_send_comm) {
         send_command();
-        flag_send_comm = 0;
+        flag_send_comm = false;
     }
 }
 
@@ -235,8 +166,7 @@ void loop() {
  * ============================================================
  */
 void send_command() {
-
-    FOCCommand::Type command_msg;
+    voltbro_foc_command_1_0 command_msg{};
 
     command_msg.angle.radian = target_angle;
     command_msg.position_feedback_gain.value = KP;
@@ -246,52 +176,49 @@ void send_command() {
 
     command_msg._torque.newton_meter = 0;
 
-    command_msg.I_kp.value = 5;
-    command_msg.I_ki.value = 1300;
+    //I_kp, I_ki  лучше не трогать
+    command_msg.I_kp.value = 4;
+    command_msg.I_ki.value = 1600;
 
-    static CanardTransferID command_transfer_id = 0;
-    cyphal_interface->send_msg<FOCCommand>(
-        &command_msg,
-        2118,
-        &command_transfer_id
-    );
+    cyphal->send_msg(&command_msg, FOC_COMMAND_TX_PORT_ID, &command_transfer_id);
 }
 
 
-/* ============================================================
- *        ГЕНЕРАЦИЯ ЗАДАЮЩЕЙ ТРАЕКТОРИИ
- * ============================================================
- */
 int sign(float val) {
     if (val < 0) return -1;
     if (val == 0) return 0;
     return 1;
 }
 
+/* ============================================================
+ *        ГЕНЕРАЦИЯ ЗАДАЮЩЕЙ ТРАЕКТОРИИ
+ * ============================================================
+ */
 void create_func() {
-
     static float amplitude = A;
-    static float freq      = FREQ;
-
+    static float freq = FREQ;
     static uint32_t t0 = millis();
-    uint32_t time_dot = millis() - t0;
 
+    uint32_t time_dot = millis() - t0;
     float t = float(time_dot) / 1000.0;
 
-    // === Выберите тип траектории ===
-
+    /* ----- Доступны три траектории, выберите одну, оставшиеся две должны быть закомментированы ----- */
+    
     // Меандр
-    // target_angle = amplitude * sign(sin(2 * PI * freq * t));
-    // target_vel   = 0;
+    target_angle = amplitude * sign(sin(2 * PI * freq * t));
+    target_vel = 0;
+
 
     // Синус
     // target_angle = amplitude * sin(2 * PI * freq * t);
-    // target_vel   = amplitude * 2 * PI * freq * cos(2 * PI * freq * t);
+    // target_vel = amplitude * 2 * PI * freq * cos(2 * PI * freq * t);
+
 
     // Треугольник
-    target_angle = amplitude - (2 * amplitude / PI) * acos(cos(2 * PI * freq * t - PI / 2));
-    target_vel   = (-4 * amplitude * freq) * sin(2 * PI * freq * t - PI / 2)
-                  / sqrt(1 - sq(cos(2 * PI * freq * t - PI / 2)));
+    // target_angle = amplitude - (2 * amplitude / PI) * acos(cos(2 * PI * freq * t - PI / 2));
+
+    // target_vel = (-4 * amplitude * freq) * sin(2 * PI * freq * t - PI / 2)
+    //            / sqrt(1 - sq(cos(2 * PI * freq * t - PI / 2)));
 }
 
 
@@ -300,34 +227,9 @@ void create_func() {
  * ============================================================
  */
 void set_flag_show_data() {
-    flag_show_data = 1;
+    flag_show_data = true;
 }
 
 void set_flag_send_command() {
-    flag_send_comm = 1;
-}
-
-
-/* ============================================================
- *        HEARTBEAT CYPHAL
- * ============================================================
- */
-void heartbeat() {
-
-    static CanardTransferID hbeat_transfer_id = 0;
-
-    HBeat::Type heartbeat_msg = {
-        .uptime = int(millis() / 1000),
-        .health = {CYPHAL_HEALTH_STATUS},
-        .mode   = {CYPHAL_MODE}
-    };
-
-    if (_is_cyphal_on) {
-        cyphal_interface->send_msg<HBeat>(
-            &heartbeat_msg,
-            uavcan_node_Heartbeat_1_0_FIXED_PORT_ID_,
-            &hbeat_transfer_id,
-            MICROS_S * 2
-        );
-    }
+    flag_send_comm = true;
 }
