@@ -1,3 +1,8 @@
+/* Подключение:
+Generic STM32G4 series 
+Board part: G431VBTx
+*/
+
 #include <utility>
 
 #include <VBCoreG4_arduino_system.h>
