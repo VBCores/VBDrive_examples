@@ -1,4 +1,5 @@
 /*
+Прошивка к VBDrive https://github.com/VBCores/VBDrive/releases/tag/1.0.0 
 Документация к прошивке VBDrive https://github.com/VBCores/VBDrive
 Библиотека для работы с cyphal https://github.com/VBCores/libcxxcanard
 Библиотека для работы с VBCoreG4 https://github.com/VBCores/VBCoreG4_arduino_system 
@@ -11,14 +12,21 @@
 /* ============================================================
  *                 ПАРАМЕТРЫ УПРАВЛЕНИЯ
  * ============================================================
- * KP, KD      — коэффициенты ПД-регулятора
+ * MOTOR_1_KP/KD — коэффициенты ПД-регулятора мотора с NODE ID 10
+ * MOTOR_2_KP/KD — коэффициенты ПД-регулятора мотора с NODE ID 11
  * A           — амплитуда задаваемой траектории
  * FREQ        — частота задаваемой траектории
+ * Для мотора с редуктором 1:10 Kp 9.0, Kd 0.23
+ * Для мотора с редуктором 1:36 Kp 12.0 Kd 0.5
  */
-#define KP    30
-#define KD    0.8
-#define A     0.7
-#define FREQ  0.5
+#define MOTOR_1_KP  12.0f  // 10 gear ratio
+#define MOTOR_1_KD  0.5f
+
+#define MOTOR_2_KP  12.0f // 36 gear ratio
+#define MOTOR_2_KD  0.5f
+
+#define A           0.7f
+#define FREQ        0.5f
 
 
 /* ============================================================
@@ -39,13 +47,17 @@ HardwareTimer *timer_send_command = new HardwareTimer(TIM3);
  * ============================================================
  */
 constexpr CanardNodeID NODE_ID = 2;
+constexpr CanardNodeID MOTOR_1_NODE_ID = 10;
+constexpr CanardNodeID MOTOR_2_NODE_ID = 11;
 constexpr CanardPortID FOC_STATE_RX_PORT_ID = 3811; // текущее состояние VBDrive
-constexpr CanardPortID FOC_COMMAND_TX_PORT_ID = 2118; // 2107 + VBDrive ID
+constexpr CanardPortID MOTOR_1_COMMAND_TX_PORT_ID = 2107 + MOTOR_1_NODE_ID;
+constexpr CanardPortID MOTOR_2_COMMAND_TX_PORT_ID = 2107 + MOTOR_2_NODE_ID;
 
 CanFD canfd;
 std::shared_ptr<ArduinoCyphal<>> cyphal;
 
-static CanardTransferID command_transfer_id = 0;
+static CanardTransferID motor_1_command_transfer_id = 0;
+static CanardTransferID motor_2_command_transfer_id = 0;
 
 
 /* ============================================================
@@ -54,7 +66,8 @@ static CanardTransferID command_transfer_id = 0;
  */
 float target_angle = 0.0;
 float target_vel = 0.0;
-float received_angle = 0.0;
+float received_angle_motor_1 = 0.0;
+float received_angle_motor_2 = 0.0;
 
 
 /* ============================================================
@@ -82,12 +95,24 @@ void send_command();
 
 //На состояние привода - угол, скорость, момент и т.п
 void foc_state_handler(const FocState& msg, CanardRxTransfer* transfer) {
-    received_angle = msg.angle.radian;
+    const CanardNodeID source_node_id = transfer->metadata.remote_node_id;
+
+    if (source_node_id == MOTOR_1_NODE_ID) {
+        received_angle_motor_1 = msg.angle.radian;
+    } else if (source_node_id == MOTOR_2_NODE_ID) {
+        received_angle_motor_2 = msg.angle.radian;
+    }
 }
 
 //Heartbeat - сообщение, которое сигнализирует о том, что привод в сети и передает данные
 void heartbeat_handler(const Heartbeat& msg, CanardRxTransfer* transfer) {
-    digitalToggle(LED2);
+    const CanardNodeID source_node_id = transfer->metadata.remote_node_id;
+
+    if (source_node_id == MOTOR_1_NODE_ID) {
+        digitalToggle(LED1);
+    } else if (source_node_id == MOTOR_2_NODE_ID) {
+        digitalToggle(LED2);
+    }
 }
 
 
@@ -113,6 +138,7 @@ void can_config(int ID) {
 
 void setup() {
     Serial.begin(115200);
+    pinMode(LED1, OUTPUT); // PD2
     pinMode(LED2, OUTPUT);
 
     can_config(NODE_ID);
@@ -149,7 +175,9 @@ void loop() {
     if (flag_show_data) {
         Serial.print(target_angle);
         Serial.print(" ");
-        Serial.println(received_angle);
+        Serial.print(received_angle_motor_1);
+        Serial.print(" ");
+        Serial.println(received_angle_motor_2);
 
         flag_show_data = false;
     }
@@ -169,18 +197,28 @@ void send_command() {
     voltbro_foc_command_1_0 command_msg{};
 
     command_msg.angle.radian = target_angle;
-    command_msg.position_feedback_gain.value = KP;
-
     command_msg.velocity.radian_per_second = target_vel;
-    command_msg.velocity_feedback_gain.value = KD;
-
     command_msg._torque.newton_meter = 0;
 
     //I_kp, I_ki  лучше не трогать
     command_msg.I_kp.value = 4;
     command_msg.I_ki.value = 1600;
 
-    cyphal->send_msg(&command_msg, FOC_COMMAND_TX_PORT_ID, &command_transfer_id);
+    command_msg.position_feedback_gain.value = MOTOR_1_KP;
+    command_msg.velocity_feedback_gain.value = MOTOR_1_KD;
+    cyphal->send_msg(
+        &command_msg,
+        MOTOR_1_COMMAND_TX_PORT_ID,
+        &motor_1_command_transfer_id
+    );
+
+    command_msg.position_feedback_gain.value = MOTOR_2_KP;
+    command_msg.velocity_feedback_gain.value = MOTOR_2_KD;
+    cyphal->send_msg(
+        &command_msg,
+        MOTOR_2_COMMAND_TX_PORT_ID,
+        &motor_2_command_transfer_id
+    );
 }
 
 
@@ -205,13 +243,13 @@ void create_func() {
     /* ----- Доступны три траектории, выберите одну, оставшиеся две должны быть закомментированы ----- */
     
     // Меандр
-    target_angle = amplitude * sign(sin(2 * PI * freq * t));
-    target_vel = 0;
+    // target_angle = amplitude * sign(sin(2 * PI * freq * t));
+    // target_vel = 0;
 
 
     // Синус
-    // target_angle = amplitude * sin(2 * PI * freq * t);
-    // target_vel = amplitude * 2 * PI * freq * cos(2 * PI * freq * t);
+    target_angle = amplitude * sin(2 * PI * freq * t);
+    target_vel = amplitude * 2 * PI * freq * cos(2 * PI * freq * t);
 
 
     // Треугольник
